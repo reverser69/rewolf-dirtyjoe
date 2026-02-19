@@ -1,0 +1,123 @@
+name: Build dirtyJOE
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    strategy:
+      matrix:
+        # Build configurations as defined by the project's batch scripts
+        config: [win32, x64]
+        include:
+          - config: win32
+            platform: Win32
+            bat_script: build_release_win32.bat
+          - config: x64
+            platform: x64
+            bat_script: build_release_x64.bat
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Setup Visual Studio command prompt
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: ${{ matrix.platform == 'x64' && 'x64' || 'x86' }}
+
+    - name: Display build environment info
+      run: |
+        echo "Building for platform: ${{ matrix.platform }}"
+        echo "Using batch script: ${{ matrix.bat_script }}"
+        cl 2>&1 | head -n 1
+      shell: pwsh
+
+    - name: Build the project using the provided batch script
+      run: |
+        # The repository includes batch files that handle the build
+        # They need to be run from the solution directory after vcvarsall is called.
+        .\${{ matrix.bat_script }}
+      shell: cmd
+      working-directory: ${{ github.workspace }}
+      # The action continues even if the build fails, so the logs are still captured.
+      continue-on-error: true
+
+    - name: Locate and prepare build artifacts
+      id: find_artifacts
+      run: |
+        # Define possible output directories based on project structure
+        $possiblePaths = @(
+            ".\Release",
+            ".\${{ matrix.platform }}\Release",
+            ".\dirtyJOE\Release",
+            ".\dirtyJOE\${{ matrix.platform }}\Release"
+        )
+
+        $foundPath = $null
+        foreach ($path in $possiblePaths) {
+            if (Test-Path $path) {
+                $foundPath = $path
+                Write-Host "Found artifacts in: $foundPath"
+                break
+            }
+        }
+
+        if ($foundPath) {
+            # Create a dedicated directory for this build's artifacts
+            $artifactDir = ".\dirtyjoe-artifacts-${{ matrix.config }}"
+            New-Item -ItemType Directory -Path $artifactDir -Force
+
+            # Copy the main executable and any related DLLs
+            Copy-Item -Path "$foundPath\*.exe" -Destination $artifactDir -ErrorAction SilentlyContinue
+            Copy-Item -Path "$foundPath\*.dll" -Destination $artifactDir -ErrorAction SilentlyContinue
+
+            # Also copy the PyJOE extension if built
+            $pyjoePaths = @(".\Python\Release", ".\Python\${{ matrix.platform }}\Release")
+            foreach ($pPath in $pyjoePaths) {
+                if (Test-Path $pPath) {
+                    Copy-Item -Path "$pPath\*.pyd" -Destination $artifactDir -ErrorAction SilentlyContinue
+                    Copy-Item -Path "$pPath\*.dll" -Destination $artifactDir -ErrorAction SilentlyContinue
+                }
+            }
+
+            # Create a simple info file
+            "Built from commit: ${{ github.sha }}" | Out-File -FilePath "$artifactDir\build-info.txt"
+            "Build date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" | Out-File -FilePath "$artifactDir\build-info.txt" -Append
+            "Platform: ${{ matrix.platform }}" | Out-File -FilePath "$artifactDir\build-info.txt" -Append
+
+            echo "artifact_path=$artifactDir" >> $env:GITHUB_OUTPUT
+        } else {
+            Write-Host "::warning::Build artifacts not found in expected paths."
+            echo "artifact_path=" >> $env:GITHUB_OUTPUT
+        }
+      shell: pwsh
+
+    - name: Upload build artifacts
+      if: steps.find_artifacts.outputs.artifact_path != ''
+      uses: actions/upload-artifact@v4
+      with:
+        name: dirtyJOE-${{ matrix.config }}-${{ github.sha }}
+        path: ${{ steps.find_artifacts.outputs.artifact_path }}/
+        if-no-files-found: warn
+        retention-days: 30
+
+    - name: Upload build logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-logs-${{ matrix.config }}
+        path: |
+          *.log
+          **/*.log
+          **/BuildLog.htm
+        retention-days: 14
